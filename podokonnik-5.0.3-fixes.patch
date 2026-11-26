@@ -1,0 +1,136 @@
+diff --git a/app.h b/app.h
+index 8b49feb..30ac50f 100644
+--- a/app.h
++++ b/app.h
+@@ -172,2 +172,5 @@ static bool gWpUserPause = false;          // пауза по горячей к
+ static std::string gWpPending;             // ждём загрузки, чтобы включить
++static constexpr int kWpKeepOverrides = -2;
++static constexpr int kWpAllMonitors = -1;
++static int gWpPendingMonitor = kWpKeepOverrides;
+ static bool gWeFound = false;
+@@ -987,11 +990,25 @@ static void wpRebuild() {
+ 
+-static void wpStartItem(const WpItem& it) {
++static void wpStartItem(const WpItem& it, int mon) {
++    if (mon >= 0 && static_cast<size_t>(mon) >= gMons.size()) return;
+     if (it.kind == "video" && videoNeedsConvert(it.path) && !fileExists(convertedPath(it.path))) {
+         std::wstring u; std::vector<std::wstring> sc;
+-        if (!gConvBusy) gWpPending = it.id;
+-        wpUrlFor(it, u, sc);   // запустит перевод в MP4; обои включатся, когда он закончится
++        if (!gConvBusy || gConvId != it.id) wpUrlFor(it, u, sc);
++        if (gConvBusy && gConvId == it.id) {
++            gWpPending = it.id;
++            gWpPendingMonitor = mon;
++        }
+         return;
+     }
+-    gWpCurrent = it.id;
+-    cfgSetStr(L"Wallpaper", W16(it.id));
++    if (mon >= 0) {
++        if (gWpMon.size() < gMons.size()) gWpMon.resize(gMons.size());
++        gWpMon[mon] = it.id;
++        saveWpMon();
++    } else {
++        if (mon == kWpAllMonitors && !gWpMon.empty()) {
++            gWpMon.clear();
++            saveWpMon();
++        }
++        gWpCurrent = it.id;
++        cfgSetStr(L"Wallpaper", W16(it.id));
++    }
+     wpRebuild();
+@@ -999,4 +1016,3 @@ static void wpStartItem(const WpItem& it) {
+ 
+-static void wpApplyOn(const std::string& id, int mon);
+-static void wpApply(const std::string& id) {
++static void wpSelect(const std::string& id, int mon) {
+     WpItem* it = findItem(id);
+@@ -1005,2 +1021,3 @@ static void wpApply(const std::string& id) {
+         gWpPending = id;
++        gWpPendingMonitor = mon;
+         int idx = atoi(id.c_str() + 8);
+@@ -1012,3 +1029,3 @@ static void wpApply(const std::string& id) {
+     gWpPending.clear();
+-    wpStartItem(*it);
++    wpStartItem(*it, mon);
+     appPushState();
+@@ -1016,3 +1033,11 @@ static void wpApply(const std::string& id) {
+ 
+-static void wpRestart() { if (!gWpWins.empty() || !gWpCurrent.empty()) wpRebuild(); }
++static void wpApply(const std::string& id) { wpSelect(id, kWpKeepOverrides); }
++
++static bool wpHasSelection() {
++    if (!gWpCurrent.empty()) return true;
++    for (const auto& id : gWpMon) if (!id.empty()) return true;
++    return false;
++}
++
++static void wpRestart() { if (!gWpWins.empty() || wpHasSelection()) wpRebuild(); }
+ 
+@@ -1020,15 +1045,10 @@ static void wpRestart() { if (!gWpWins.empty() || !gWpCurrent.empty()) wpRebuild
+ static void wpApplyOn(const std::string& id, int mon) {
+-    if (mon < 0 || gMons.size() < 2) {
+-        if (!gWpMon.empty()) { gWpMon.clear(); saveWpMon(); }
+-        wpApply(id);
+-        return;
+-    }
+-    WpItem* it = findItem(id);
+-    if (!it) return;
+-    if (it->source == "builtin" && !itemReady(*it)) { wpApply(id); return; }   // сначала скачаем
+-    if (gWpMon.size() < gMons.size()) gWpMon.resize(gMons.size());
+-    gWpMon[mon] = id;
+-    saveWpMon();
+-    wpRebuild();
+-    appPushState();
++    if (mon >= 0 && static_cast<size_t>(mon) >= gMons.size()) return;
++    wpSelect(id, mon < 0 || gMons.size() < 2 ? kWpAllMonitors : mon);
++}
++
++static void wpFinishPending(const std::string& id) {
++    if (gWpPending != id) return;
++    gWpPending.clear();
++    if (WpItem* it = findItem(id)) wpStartItem(*it, gWpPendingMonitor);
+ }
+@@ -1867,4 +1887,6 @@ static bool appMsg(UINT msg, WPARAM wp, LPARAM lp) {
+     if (msg == WM_CONVDONE) {
++        // Keep gConvId and the paths stable until the UI handles this result.
++        InterlockedExchange(&gConvBusy, 0);
+         if (WpItem* it = findItem(gConvId)) it->progress = -1;
+-        if (wp == 1 && gWpPending == gConvId) { gWpPending.clear(); if (WpItem* it = findItem(gConvId)) wpStartItem(*it); }
++        if (wp == 1 && gWpPending == gConvId) wpFinishPending(gConvId);
+         else if (wp == 1) { for (auto& x : gWpMon) if (x == gConvId) { wpRebuild(); break; } }
+@@ -1887,3 +1909,3 @@ static bool appMsg(UINT msg, WPARAM wp, LPARAM lp) {
+         if (WpItem* it = findItem(id)) it->progress = -1;
+-        if (lp == 1 && gWpPending == id) { gWpPending.clear(); if (WpItem* it = findItem(id)) wpStartItem(*it); }
++        if (lp == 1) wpFinishPending(id);
+         if (lp == 0) { if (gWpPending == id) gWpPending.clear(); appToast("Не получилось скачать видео. Проверь интернет и попробуй ещё раз."); }
+diff --git a/build.sh b/build.sh
+index 9ffff3c..40da600 100644
+--- a/build.sh
++++ b/build.sh
+@@ -4,2 +4,3 @@ set -e
+ cd "$(dirname "$0")"
++mkdir -p build
+ python3 - <<'PY'
+@@ -48,3 +49,3 @@ for f in third_party/tinf/tinflate.c third_party/tinf/tinfgzip.c third_party/tin
+ done
+-x86_64-w64-mingw32-g++ -std=c++17 -O2 -municode -mwindows -static -I. sugrob.cpp build/res.o build/c/*.o -o build/Podokonnik-sym.exe \
++x86_64-w64-mingw32-g++ -std=c++17 -O2 -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00 -municode -mwindows -static -I. sugrob.cpp build/res.o build/c/*.o -o build/Podokonnik-sym.exe \
+   -ldwmapi -lwinmm -lwinhttp -lcomctl32 -lole32 -luuid -lshell32 -lmfuuid -ldxguid -lwindowscodecs -lbcrypt -loleaut32
+diff --git a/convert.h b/convert.h
+index ed0d5ad..d502dac 100644
+--- a/convert.h
++++ b/convert.h
+@@ -185,3 +185,2 @@ static DWORD WINAPI ConvThread(LPVOID) {
+     PostMessageW(gMsgWnd, WM_CONVDONE, ok ? 1 : 0, 0);
+-    InterlockedExchange(&gConvBusy, 0);
+     return 0;
+diff --git a/sugrob.cpp b/sugrob.cpp
+index a2d9b3e..1138b39 100644
+--- a/sugrob.cpp
++++ b/sugrob.cpp
+@@ -3398,3 +3398,3 @@ static void showMenu() {
+     AppendMenuW(m, MF_POPUP | (gMusicOn || gRadioOn ? MF_CHECKED : 0), (UINT_PTR)mm, TW(L"Музыка", L"Music"));
+-    if (!gWpCurrent.empty()) {
++    if (wpHasSelection()) {
+         HMENU wm = CreatePopupMenu();
